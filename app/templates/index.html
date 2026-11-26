@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>广播剧混音审听台</title>
+<style>
+  :root { --ok:#1a7f37; --warn:#9a6700; --line:#d0d7de; --bg:#f6f8fa; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: var(--bg); color: #1f2328; }
+  header { background: #24292f; color: #fff; padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 20px; }
+  header .sub { margin: 4px 0 0; font-size: 13px; color: #adb6c0; }
+  main { max-width: 1080px; margin: 18px auto; padding: 0 16px 40px; }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 8px;
+          padding: 14px 18px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 10px; font-size: 16px; }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  button { background: #1f6feb; color: #fff; border: 0; border-radius: 6px;
+           padding: 7px 14px; font-size: 14px; cursor: pointer; }
+  button:disabled { background: #94a3b8; cursor: not-allowed; }
+  button.ghost { background: #eaeef2; color: #1f2328; }
+  button.small { padding: 4px 10px; font-size: 13px; margin-right: 6px; }
+  .hint { color: #57606a; font-size: 12.5px; margin: 8px 0 0; }
+  .msg { font-size: 13px; color: #cf222e; }
+  .msg.okmsg { color: var(--ok); }
+  .hidden { display: none; }
+  table { border-collapse: collapse; width: 100%; margin-top: 10px; }
+  th, td { border-bottom: 1px solid var(--line); padding: 7px 8px; font-size: 13.5px;
+           text-align: left; }
+  th { background: #f6f8fa; }
+  td.num, td.hash { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+  td.ok { color: var(--ok); font-weight: 600; }
+  td.warn { color: var(--warn); font-weight: 600; }
+  .tracks { display: flex; gap: 18px; flex-wrap: wrap; }
+  .track { flex: 1 1 320px; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
+  .track h3 { margin: 0 0 8px; font-size: 14px; }
+  .mrow { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+  .mrow input { width: 110px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; }
+  .mrow .del { padding: 2px 8px; }
+  audio { width: 340px; height: 36px; vertical-align: middle; }
+  #playingLabel { margin-left: 10px; font-size: 13px; color: #57606a; }
+  #info b { color: #0969da; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎧 广播剧混音审听台</h1>
+  <p class="sub">交片前逐段审听 · 双轨相加限幅 · 每 5 秒一段 · 全部通过方可下载</p>
+</header>
+<main>
+  <section class="card">
+    <h2>1. 上传同一集的两条轨</h2>
+    <div class="row">
+      <label>轨 A <input type="file" id="fileA" accept=".wav,audio/wav"></label>
+      <label>轨 B <input type="file" id="fileB" accept=".wav,audio/wav"></label>
+      <button id="btnUpload">上传</button>
+      <button id="btnSample" class="ghost">载入内置样例</button>
+    </div>
+    <p class="hint">要求：16 位单声道 PCM WAV，两轨等长、同采样率。上传新集会清空全部通过状态。</p>
+    <p class="msg" id="uploadMsg"></p>
+  </section>
+
+  <div id="main" class="hidden">
+    <section class="card">
+      <h2>2. 剧集信息</h2>
+      <div id="info"></div>
+    </section>
+
+    <section class="card">
+      <h2>3. 静音编辑（按采样编号，半开区间 [起, 止)）</h2>
+      <div class="tracks">
+        <div class="track" id="trackA">
+          <h3>轨 A 静音区间</h3>
+          <div class="mutes"></div>
+          <button class="ghost small addMute">＋添加区间</button>
+          <button class="ghost small clearMute">清除本轨静音</button>
+        </div>
+        <div class="track" id="trackB">
+          <h3>轨 B 静音区间</h3>
+          <div class="mutes"></div>
+          <button class="ghost small addMute">＋添加区间</button>
+          <button class="ghost small clearMute">清除本轨静音</button>
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="btnSaveMutes">保存静音改动</button>
+        <span class="msg" id="muteMsg"></span>
+      </div>
+      <p class="hint">保存后，仅混音样本值实际发生变化的段落需要重新试听确认；保存失败不会改变原有混音与通过状态。</p>
+    </section>
+
+    <section class="card">
+      <h2>4. 逐段试听与确认</h2>
+      <audio id="player" controls></audio><span id="playingLabel"></span>
+      <table id="segTable">
+        <thead>
+          <tr><th>段</th><th>时间</th><th>采样区间</th><th>状态</th><th>混音哈希</th><th>操作</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <p class="hint">确认时校验"刚试听的混音"与该段当前内容一致；若他处改动了静音导致内容变化，需重新试听。</p>
+    </section>
+
+    <section class="card">
+      <h2>5. 下载整集</h2>
+      <div class="row">
+        <button id="btnDownload" disabled>⬇ 下载整集 WAV</button>
+        <span class="msg" id="dlMsg"></span>
+      </div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+let state = null;
+let lastVersion = null;
+let editorDirty = false;
+const listened = {};   // 段号 -> 最近一次试听到的混音哈希
+
+const fmtTime = t => `${Math.floor(t/60)}:${(t%60).toFixed(1).padStart(4,'0')}`;
+const shortHash = h => h ? h.slice(0, 10) : '—';
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/state', {cache: 'no-store'});
+    state = await r.json();
+    render();
+  } catch (e) { /* 网络抖动时保留旧画面 */ }
+}
+
+function render() {
+  if (!state || !state.loaded) { $('#main').classList.add('hidden'); return; }
+  $('#main').classList.remove('hidden');
+
+  const passed = state.segments.filter(s => s.passed).length;
+  $('#info').innerHTML =
+    `采样率 <b>${state.sample_rate}</b> Hz · 时长 <b>${fmtTime(state.duration)}</b>` +
+    `（${state.num_samples} 采样）· 共 <b>${state.segments.length}</b> 段` +
+    `（每段 ${state.segment_seconds} 秒，末段可不足）· 已通过 <b>${passed} / ${state.segments.length}</b>`;
+
+  if (state.version !== lastVersion) {
+    if (editorDirty) {
+      setMsg('#muteMsg', '⚠️ 静音内容已被其他窗口修改，本地面板未同步；保存将以面板内容为准。', false);
+    } else {
+      syncEditors(state.mutes);
+    }
+    lastVersion = state.version;
+  }
+
+  const tb = document.querySelector('#segTable tbody');
+  tb.innerHTML = '';
+  for (const seg of state.segments) {
+    const isListened = listened[seg.index] === seg.hash;
+    let status, cls;
+    if (seg.passed) { status = '✅ 已通过'; cls = 'ok'; }
+    else if (isListened) { status = '🎧 已试听，待确认'; cls = 'warn'; }
+    else { status = '⬜ 未通过'; cls = ''; }
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      `<td>${seg.index + 1}</td>` +
+      `<td>${fmtTime(seg.t0)} – ${fmtTime(seg.t1)}</td>` +
+      `<td class="num">[${seg.start_sample}, ${seg.end_sample})</td>` +
+      `<td class="${cls}">${status}</td>` +
+      `<td class="hash" title="${seg.hash}">${shortHash(seg.hash)}</td>` +
+      `<td></td>`;
+    const ops = tr.lastElementChild;
+    const bPlay = document.createElement('button');
+    bPlay.className = 'small'; bPlay.textContent = '▶ 试听';
+    bPlay.onclick = () => audition(seg.index);
+    const bOk = document.createElement('button');
+    bOk.className = 'small'; bOk.textContent = '✔ 确认通过';
+    bOk.disabled = !(isListened && !seg.passed);
+    bOk.onclick = () => confirmSeg(seg.index);
+    ops.append(bPlay, bOk);
+    tb.appendChild(tr);
+  }
+
+  $('#btnDownload').disabled = !state.all_passed;
+  setMsg('#dlMsg', state.all_passed ? '全部段落已通过，可下载。' : '全部段落通过后才可下载。',
+         state.all_passed);
+}
+
+function setMsg(sel, text, ok) {
+  const el = $(sel);
+  el.textContent = text;
+  el.classList.toggle('okmsg', !!ok);
+}
+
+async function audition(i) {
+  const r = await fetch(`/api/segment/${i}.wav`, {cache: 'no-store'});
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    alert('试听失败：' + (d.error || r.status));
+    return;
+  }
+  const h = r.headers.get('X-Mix-Hash');
+  const blob = await r.blob();
+  const player = $('#player');
+  player.src = URL.createObjectURL(blob);
+  player.play().catch(() => {});
+  listened[i] = h;
+  $('#playingLabel').textContent = `正在播放第 ${i + 1} 段（哈希 ${shortHash(h)}）`;
+  render();
+}
+
+async function confirmSeg(i) {
+  const r = await fetch(`/api/confirm/${i}`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({hash: listened[i] || ''})
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    alert(d.error || '确认失败');
+    delete listened[i];
+  }
+  await refresh();
+}
+
+function syncEditors(mutes) {
+  for (const t of ['A', 'B']) {
+    const box = document.querySelector(`#track${t} .mutes`);
+    box.innerHTML = '';
+    for (const [s, e] of mutes[t]) addRow(t, s, e);
+  }
+}
+
+function addRow(t, s, e) {
+  const box = document.querySelector(`#track${t} .mutes`);
+  const div = document.createElement('div');
+  div.className = 'mrow';
+  div.innerHTML =
+    `<input type="number" min="0" step="1" placeholder="起" value="${s ?? ''}"> — ` +
+    `<input type="number" min="0" step="1" placeholder="止" value="${e ?? ''}">` +
+    `<button class="ghost small del">✕</button>`;
+  div.querySelector('.del').onclick = () => { div.remove(); editorDirty = true; };
+  div.querySelectorAll('input').forEach(inp => inp.oninput = () => { editorDirty = true; });
+  box.appendChild(div);
+}
+
+function collectMutes() {
+  const out = {A: [], B: []};
+  for (const t of ['A', 'B']) {
+    for (const row of document.querySelectorAll(`#track${t} .mrow`)) {
+      const [a, b] = row.querySelectorAll('input');
+      if (a.value === '' && b.value === '') continue;
+      out[t].push([Number(a.value), Number(b.value)]);
+    }
+  }
+  return out;
+}
+
+async function saveMutes() {
+  const r = await fetch('/api/mutes', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(collectMutes())
+  });
+  const d = await r.json().catch(() => ({}));
+  if (r.ok) {
+    editorDirty = false;
+    const inv = d.invalidated || [];
+    setMsg('#muteMsg', inv.length
+      ? `已保存。${inv.length} 段混音发生变化，需重新试听：第 ${inv.map(i => i + 1).join('、')} 段。`
+      : '已保存，无段落受影响。', true);
+    await refresh();
+  } else {
+    setMsg('#muteMsg', '保存失败（原有混音与通过状态未变）：' + (d.error || r.status), false);
+  }
+}
+
+document.querySelectorAll('.addMute').forEach(btn =>
+  btn.onclick = () => { addRow(btn.closest('.track').id.slice(-1)); editorDirty = true; });
+document.querySelectorAll('.clearMute').forEach(btn =>
+  btn.onclick = () => {
+    const box = btn.closest('.track').querySelector('.mutes');
+    box.innerHTML = '';
+    editorDirty = true;
+    saveMutes();   // 清除本轨静音并立即保存
+  });
+$('#btnSaveMutes').onclick = saveMutes;
+
+$('#btnUpload').onclick = async () => {
+  const fa = $('#fileA').files[0], fb = $('#fileB').files[0];
+  if (!fa || !fb) { setMsg('#uploadMsg', '请选择两条轨的 WAV 文件', false); return; }
+  const fd = new FormData();
+  fd.append('track_a', fa);
+  fd.append('track_b', fb);
+  const r = await fetch('/api/upload', {method: 'POST', body: fd});
+  const d = await r.json().catch(() => ({}));
+  if (r.ok) {
+    setMsg('#uploadMsg', '上传成功。', true);
+    Object.keys(listened).forEach(k => delete listened[k]);
+    editorDirty = false;
+    await refresh();
+  } else {
+    setMsg('#uploadMsg', '上传失败：' + (d.error || r.status), false);
+  }
+};
+
+$('#btnSample').onclick = async () => {
+  const r = await fetch('/api/load_sample', {method: 'POST'});
+  const d = await r.json().catch(() => ({}));
+  if (r.ok) {
+    setMsg('#uploadMsg', '已载入内置样例（27 秒，6 段；第 3 段含限幅演示）。', true);
+    Object.keys(listened).forEach(k => delete listened[k]);
+    editorDirty = false;
+    await refresh();
+  } else {
+    setMsg('#uploadMsg', '载入样例失败：' + (d.error || r.status), false);
+  }
+};
+
+$('#btnDownload').onclick = () => {
+  if (state && state.all_passed) window.location = '/api/download';
+};
+
+refresh();
+setInterval(refresh, 2000);   // 轮询同步其他窗口的改动
+</script>
+</body>
+</html>
