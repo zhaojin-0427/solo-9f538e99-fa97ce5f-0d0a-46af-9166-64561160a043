@@ -35,7 +35,13 @@
   td.warn { color: var(--warn); font-weight: 600; }
   .tracks { display: flex; gap: 18px; flex-wrap: wrap; }
   .track { flex: 1 1 320px; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; }
+  .track.stale { border-color: #d4a72c; }
+  .track.conflict { border-color: #cf222e; box-shadow: 0 0 0 2px rgba(207,34,46,.15); }
   .track h3 { margin: 0 0 8px; font-size: 14px; }
+  .trackmsg { font-size: 12.5px; margin: 6px 0 0; }
+  .trackmsg.stale { color: var(--warn); }
+  .trackmsg.conflict { color: #cf222e; }
+  .trackmsg button { margin-left: 8px; padding: 2px 8px; font-size: 12px; }
   .mrow { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
   .mrow input { width: 110px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; }
   .mrow .del { padding: 2px 8px; }
@@ -74,12 +80,14 @@
         <div class="track" id="trackA">
           <h3>轨 A 静音区间</h3>
           <div class="mutes"></div>
+          <p class="trackmsg hidden"></p>
           <button class="ghost small addMute">＋添加区间</button>
           <button class="ghost small clearMute">清除本轨静音</button>
         </div>
         <div class="track" id="trackB">
           <h3>轨 B 静音区间</h3>
           <div class="mutes"></div>
+          <p class="trackmsg hidden"></p>
           <button class="ghost small addMute">＋添加区间</button>
           <button class="ghost small clearMute">清除本轨静音</button>
         </div>
@@ -88,7 +96,7 @@
         <button id="btnSaveMutes">保存静音改动</button>
         <span class="msg" id="muteMsg"></span>
       </div>
-      <p class="hint">保存后，仅混音样本值实际发生变化的段落需要重新试听确认；保存失败不会改变原有混音与通过状态。</p>
+      <p class="hint">只提交本端改过的轨；未提交的轨保留服务端当前改动。若同轨在编辑期间被其他窗口保存，整次保存被拒绝并标出冲突轨，面板输入保留，可载入服务端版本后处理。保存失败不会改变原有混音与通过状态。</p>
     </section>
 
     <section class="card">
@@ -117,8 +125,13 @@
 const $ = s => document.querySelector(s);
 let state = null;
 let lastVersion = null;
-let editorDirty = false;
-const listened = {};   // 段号 -> 最近一次试听到的混音哈希
+const listened = {};        // 段号 -> 最近一次试听到的混音哈希
+// 每轨：baseVersion 为面板同步时的服务端版本、dirty 表示本端有未保存改动、
+// conflict 表示上次保存因同轨冲突被拒（输入仍保留）
+const editors = {
+  A: {baseVersion: null, dirty: false, conflict: false},
+  B: {baseVersion: null, dirty: false, conflict: false}
+};
 
 const fmtTime = t => `${Math.floor(t/60)}:${(t%60).toFixed(1).padStart(4,'0')}`;
 const shortHash = h => h ? h.slice(0, 10) : '—';
@@ -129,6 +142,37 @@ async function refresh() {
     state = await r.json();
     render();
   } catch (e) { /* 网络抖动时保留旧画面 */ }
+}
+
+function trackBanner(t, mode, html) {
+  const el = document.querySelector(`#track${t} .trackmsg`);
+  el.className = `trackmsg ${mode || ''}`;
+  el.innerHTML = html || '';
+  el.classList.toggle('hidden', !mode);
+}
+
+function updateTrackBanners() {
+  for (const t of ['A', 'B']) {
+    const ed = editors[t];
+    const el = document.querySelector(`#track${t}`);
+    const stale = !ed.conflict && ed.dirty && ed.baseVersion !== null
+      && state && state.track_versions && ed.baseVersion !== state.track_versions[t];
+    el.classList.toggle('conflict', ed.conflict);
+    el.classList.toggle('stale', stale);
+    if (ed.conflict) {
+      trackBanner(t, 'conflict',
+        '⛔ 同轨被其他窗口抢先保存，本端输入已保留、整次保存被拒绝。' +
+        '<button class="ghost small loadServer">载入服务端版本</button>');
+      el.querySelector('.loadServer').onclick = () => adoptServer(t);
+    } else if (stale) {
+      trackBanner(t, 'stale',
+        '⚠️ 该轨已被其他窗口修改，本端仍保留未保存的输入；直接保存将被拒绝。' +
+        '<button class="ghost small loadServer">载入服务端版本</button>');
+      el.querySelector('.loadServer').onclick = () => adoptServer(t);
+    } else {
+      trackBanner(t, null, '');
+    }
+  }
 }
 
 function render() {
@@ -142,13 +186,14 @@ function render() {
     `（每段 ${state.segment_seconds} 秒，末段可不足）· 已通过 <b>${passed} / ${state.segments.length}</b>`;
 
   if (state.version !== lastVersion) {
-    if (editorDirty) {
-      setMsg('#muteMsg', '⚠️ 静音内容已被其他窗口修改，本地面板未同步；保存将以面板内容为准。', false);
-    } else {
-      syncEditors(state.mutes);
+    // 未改动的轨直接同步服务端；正在编辑的轨保留输入，仅以横幅提示过期
+    for (const t of ['A', 'B']) {
+      const ed = editors[t];
+      if (!ed.dirty && !ed.conflict) syncEditor(t, state.mutes[t], state.track_versions[t]);
     }
     lastVersion = state.version;
   }
+  updateTrackBanners();
 
   const tb = document.querySelector('#segTable tbody');
   tb.innerHTML = '';
@@ -220,12 +265,26 @@ async function confirmSeg(i) {
   await refresh();
 }
 
-function syncEditors(mutes) {
-  for (const t of ['A', 'B']) {
-    const box = document.querySelector(`#track${t} .mutes`);
-    box.innerHTML = '';
-    for (const [s, e] of mutes[t]) addRow(t, s, e);
-  }
+function syncEditor(t, mutes, version) {
+  const box = document.querySelector(`#track${t} .mutes`);
+  box.innerHTML = '';
+  for (const [s, e] of mutes) addRow(t, s, e);
+  editors[t].baseVersion = version;
+  editors[t].dirty = false;
+  editors[t].conflict = false;
+}
+
+function adoptServer(t) {
+  // 放弃本端输入，载入服务端当前静音表（优先用冲突响应回带的数据）
+  const serverMutes = editors[t].serverMutes
+    || (state && state.mutes ? state.mutes[t] : []);
+  const serverVersion = editors[t].serverVersion
+    ?? (state && state.track_versions ? state.track_versions[t] : null);
+  syncEditor(t, serverMutes, serverVersion);
+  delete editors[t].serverMutes;
+  delete editors[t].serverVersion;
+  updateTrackBanners();
+  setMsg('#muteMsg', `已载入轨 ${t} 的服务端版本，可在此基础上重新编辑。`, true);
 }
 
 function addRow(t, s, e) {
@@ -236,52 +295,104 @@ function addRow(t, s, e) {
     `<input type="number" min="0" step="1" placeholder="起" value="${s ?? ''}"> — ` +
     `<input type="number" min="0" step="1" placeholder="止" value="${e ?? ''}">` +
     `<button class="ghost small del">✕</button>`;
-  div.querySelector('.del').onclick = () => { div.remove(); editorDirty = true; };
-  div.querySelectorAll('input').forEach(inp => inp.oninput = () => { editorDirty = true; });
+  div.querySelector('.del').onclick = () => { div.remove(); markDirty(t); };
+  div.querySelectorAll('input').forEach(inp => inp.oninput = () => markDirty(t));
   box.appendChild(div);
 }
 
-function collectMutes() {
-  const out = {A: [], B: []};
-  for (const t of ['A', 'B']) {
-    for (const row of document.querySelectorAll(`#track${t} .mrow`)) {
-      const [a, b] = row.querySelectorAll('input');
-      if (a.value === '' && b.value === '') continue;
-      out[t].push([Number(a.value), Number(b.value)]);
-    }
+function markDirty(t) {
+  editors[t].dirty = true;
+  editors[t].conflict = false;
+  updateTrackBanners();
+}
+
+function collectTrack(t) {
+  const out = [];
+  for (const row of document.querySelectorAll(`#track${t} .mrow`)) {
+    const [a, b] = row.querySelectorAll('input');
+    if (a.value === '' && b.value === '') continue;
+    out.push([Number(a.value), Number(b.value)]);
   }
   return out;
 }
 
-async function saveMutes() {
-  const r = await fetch('/api/mutes', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(collectMutes())
-  });
-  const d = await r.json().catch(() => ({}));
+async function saveMutes(onlyTrack) {
+  const targets = onlyTrack ? [onlyTrack] : ['A', 'B'].filter(t => editors[t].dirty);
+  if (targets.length === 0) {
+    setMsg('#muteMsg', '没有需要保存的改动。', true);
+    return;
+  }
+  const payload = {base_versions: {}};
+  for (const t of targets) {
+    payload[t] = collectTrack(t);
+    if (editors[t].baseVersion !== null) payload.base_versions[t] = editors[t].baseVersion;
+  }
+  let r, d;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    r = await fetch('/api/mutes', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    d = await r.json().catch(() => ({}));
+    // 瞬时繁忙（无同轨冲突）：原样自动重试；同轨冲突跳出走人工解决
+    if (r.status === 409 && d.retryable && !d.conflicts) {
+      setMsg('#muteMsg', `服务端正忙于合并并发改动，自动重试中（${attempt + 1}/5）…`, false);
+      await new Promise(res => setTimeout(res, 200 * (attempt + 1)));
+      continue;
+    }
+    break;
+  }
   if (r.ok) {
-    editorDirty = false;
+    for (const t of targets) {
+      editors[t].dirty = false;
+      editors[t].conflict = false;
+    }
     const inv = d.invalidated || [];
     setMsg('#muteMsg', inv.length
       ? `已保存。${inv.length} 段混音发生变化，需重新试听：第 ${inv.map(i => i + 1).join('、')} 段。`
       : '已保存，无段落受影响。', true);
-    await refresh();
+    await refresh();   // 同步所有轨的最新服务端版本（未编辑轨自动跟进）
+  } else if (r.status === 409 && d.conflicts) {
+    // 同轨冲突：整次拒绝，全部本端输入保留；标出冲突轨并展示服务端版本
+    for (const t of targets) {
+      if (d.conflicts.includes(t)) {
+        editors[t].conflict = true;
+        editors[t].serverMutes = d.server_mutes[t];
+        editors[t].serverVersion = d.server_track_versions[t];
+      }
+    }
+    setMsg('#muteMsg', '保存被拒绝：轨 ' + d.conflicts.join('、')
+      + ' 在本窗口编辑期间已被其他窗口保存。面板输入已保留，可对照服务端版本处理后重试。', false);
+    updateTrackBanners();
   } else {
     setMsg('#muteMsg', '保存失败（原有混音与通过状态未变）：' + (d.error || r.status), false);
   }
 }
 
 document.querySelectorAll('.addMute').forEach(btn =>
-  btn.onclick = () => { addRow(btn.closest('.track').id.slice(-1)); editorDirty = true; });
-document.querySelectorAll('.clearMute').forEach(btn =>
+  btn.onclick = () => markDirty(btn.closest('.track').id.slice(-1)));
+document.querySelectorAll('.clearMute').forEach(btn => {
+  const t = btn.closest('.track').id.slice(-1);
   btn.onclick = () => {
-    const box = btn.closest('.track').querySelector('.mutes');
-    box.innerHTML = '';
-    editorDirty = true;
-    saveMutes();   // 清除本轨静音并立即保存
-  });
-$('#btnSaveMutes').onclick = saveMutes;
+    btn.closest('.track').querySelector('.mutes').innerHTML = '';
+    markDirty(t);
+    saveMutes(t);   // 清除本轨静音并立即保存（只提交该轨，另一轨改动不受影响）
+  };
+});
+$('#btnSaveMutes').onclick = () => saveMutes();
+
+function resetAfterReload() {
+  Object.keys(listened).forEach(k => delete listened[k]);
+  for (const t of ['A', 'B']) {
+    editors[t].dirty = false;
+    editors[t].conflict = false;
+    editors[t].baseVersion = null;
+    delete editors[t].serverMutes;
+    delete editors[t].serverVersion;
+  }
+  lastVersion = null;
+}
 
 $('#btnUpload').onclick = async () => {
   const fa = $('#fileA').files[0], fb = $('#fileB').files[0];
@@ -293,8 +404,7 @@ $('#btnUpload').onclick = async () => {
   const d = await r.json().catch(() => ({}));
   if (r.ok) {
     setMsg('#uploadMsg', '上传成功。', true);
-    Object.keys(listened).forEach(k => delete listened[k]);
-    editorDirty = false;
+    resetAfterReload();
     await refresh();
   } else {
     setMsg('#uploadMsg', '上传失败：' + (d.error || r.status), false);
@@ -306,8 +416,7 @@ $('#btnSample').onclick = async () => {
   const d = await r.json().catch(() => ({}));
   if (r.ok) {
     setMsg('#uploadMsg', '已载入内置样例（27 秒，6 段；第 3 段含限幅演示）。', true);
-    Object.keys(listened).forEach(k => delete listened[k]);
-    editorDirty = false;
+    resetAfterReload();
     await refresh();
   } else {
     setMsg('#uploadMsg', '载入样例失败：' + (d.error || r.status), false);

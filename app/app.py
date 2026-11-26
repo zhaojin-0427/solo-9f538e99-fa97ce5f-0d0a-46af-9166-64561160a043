@@ -6,6 +6,8 @@
 - 两轨相加并限幅到 16 位得到混音；混音按 5 秒一段（末段可不足 5 秒）
 - 逐段试听并确认通过；确认时校验"刚试听的 PCM"与该段当前内容一致（哈希）
 - 保存静音改动后，仅混音样本值实际变化的段需要重听；保存失败则原混音与通过状态不变
+- 按轨乐观并发（base_versions）：只改一轨的提交不会覆盖另一轨被他处并发保存的改动；
+  同轨在编辑期间被他处保存则整次拒绝（409）并标出冲突轨，由人工解决，不做静默覆盖
 - 全部段落通过后才可下载整集 WAV；下载按段流式生成，内存中最多暂存一段混音 PCM
 - 下载开始后即快照当时通过的混音，浏览器停读/断连不影响他人保存改动
 """
@@ -14,6 +16,7 @@ import hashlib
 import os
 import struct
 import threading
+import time
 import wave
 
 import numpy as np
@@ -22,6 +25,12 @@ from flask import Flask, Response, jsonify, render_template, request
 SEGMENT_SECONDS = 5
 INT16_MIN, INT16_MAX = -32768, 32767
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+
+# 静音保存时，非提交轨被他处并发修改后的锁外重算重试上限（同轨冲突不重试，直接拒绝）。
+# 该上限只在极端高并发（多个无基线旧客户端持续交错）下可能触及，返回 409 且不带
+# conflicts，语义为"瞬时繁忙、可原样重试"，与同轨内容冲突（带 conflicts、须人工解决）区分。
+MAX_MERGE_RETRIES = 25
+TRACKS = ("A", "B")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SAMPLES_DIR = os.environ.get("SAMPLES_DIR", os.path.normpath(os.path.join(BASE_DIR, "..", "samples")))
@@ -117,6 +126,10 @@ class Episode:
         self.seg_hashes = []                   # 每段当前混音哈希
         self.confirmed_hashes = []             # 每段"曾被确认通过"的哈希集合（持久保留）
         self.version = 0                       # 上传/静音保存时递增，供前端发现外部修改
+        # 每轨静音表的独立版本号：仅该轨静音被提交替换（或重传）时递增。
+        # 用于按轨乐观并发：窗口只改 A 轨时，B 轨被他处保存不会导致本次失败；
+        # 同一轨被并发改动且基线过期时，整次保存被拒绝（同轨冲突）。
+        self.track_versions = {"A": 0, "B": 0}
 
     def seg_len(self):
         return self.sample_rate * SEGMENT_SECONDS
@@ -155,6 +168,8 @@ class Episode:
             "all_passed": self.all_passed(),
             "mutes": {"A": [list(r) for r in self.mutes["A"]],
                       "B": [list(r) for r in self.mutes["B"]]},
+            "track_versions": {"A": self.track_versions["A"],
+                               "B": self.track_versions["B"]},
             "version": self.version,
         }
 
@@ -176,6 +191,7 @@ def install_episode(track_a, track_b, rate):
         EP.confirmed_hashes = [set() for _ in hashes]
         EP.loaded = True
         EP.version += 1
+        EP.track_versions = {"A": 0, "B": 0}
         return EP.to_dict(), None
 
 
@@ -247,26 +263,58 @@ def _as_int(value):
 
 @app.post("/api/mutes")
 def api_save_mutes():
-    """保存静音改动。任一区间非法则整体失败，原混音与通过状态保持不变。
+    """按轨乐观并发地保存静音改动。任一区间非法则整体失败，原状态保持不变。
 
-    请求体：{"A": [[start, end], ...], "B": [...]}；缺省的轨保持原样。
+    请求体：
+      {"A": [[start, end], ...], "B": [...], "base_versions": {"A": 3, "B": 5}}
+    - 只有出现在请求体中的轨会被替换；未出现的轨保持服务端当前值
+      （兼容只提交一轨的旧调用），因此两个窗口分别改 A / B 并发提交时，
+      后保存者不会抹掉先保存者的另一轨改动。
+    - base_versions（可选）给出各提交轨所依据的服务端版本。版本不匹配说明
+      同轨在本窗口编辑期间已被他处保存：整次拒绝（409），标出冲突轨，响应
+      回带服务端当前静音表与客户端提交内容，便于前端保留输入并提示解决。
+    - 哈希在锁外重算；重算期间未提交轨（或无基线的旧客户端所提交轨）被并发
+      改动时，自动取最新另一轨重算并重试合并，保证两轨改动都生效。
     """
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"error": "请求体须为 JSON 对象"}), 400
+
+    submitted = [t for t in TRACKS if t in body]
+    if not submitted:
+        return jsonify({"error": "请求未包含任何轨的静音数据（A 或 B）"}), 400
+    for key in body:
+        if key not in (*TRACKS, "base_versions"):
+            return jsonify({"error": f"未知字段：{key}"}), 400
+
+    raw_bases = body.get("base_versions")
+    if raw_bases is None:
+        raw_bases = {}
+    if not isinstance(raw_bases, dict):
+        return jsonify({"error": "base_versions 须为对象"}), 400
+    base_versions = {}
+    for t, v in raw_bases.items():
+        if t not in TRACKS:
+            return jsonify({"error": f"base_versions 中存在未知轨：{t}"}), 400
+        try:
+            bv = _as_int(v)
+        except ValueError:
+            return jsonify({"error": f"轨 {t} 的基线版本号非法"}), 400
+        if bv < 0:
+            return jsonify({"error": f"轨 {t} 的基线版本号不能为负"}), 400
+        base_versions[t] = bv
+    for t in base_versions:
+        if t not in submitted:
+            return jsonify({"error": f"轨 {t} 未提交静音数据，不能携带其基线版本号"}), 400
+
     with EP.lock:
         if not EP.loaded:
             return jsonify({"error": "尚未上传音频"}), 409
-        tracks = EP.tracks
-        rate = EP.sample_rate
         n = EP.num_samples
-        cur_mutes = {"A": list(EP.mutes["A"]), "B": list(EP.mutes["B"])}
 
-    new_mutes = {}
-    for t in ("A", "B"):
-        if t not in body:
-            new_mutes[t] = cur_mutes[t]
-            continue
+    # 区间校验全部发生在任何状态修改之前；非法 -> 整体 400
+    payload_mutes = {}
+    for t in submitted:
         raw_list = body[t]
         if not isinstance(raw_list, list):
             return jsonify({"error": f"轨 {t} 的静音列表格式错误"}), 400
@@ -280,23 +328,78 @@ def api_save_mutes():
                 return jsonify({"error": f"轨 {t} 静音区间 [{s}, {e}) 须满足 0 ≤ 起 < 止 ≤ {n}"}), 400
             ranges.append((s, e))
         ranges.sort()
-        new_mutes[t] = ranges
+        payload_mutes[t] = ranges
 
-    # 先在锁外算好全部新哈希；任何异常都发生在状态被修改之前
-    new_hashes = compute_seg_hashes(tracks["A"], tracks["B"], new_mutes, rate, n)
+    def conflict_payload(conflicts):
+        with EP.lock:
+            server_mutes = {"A": [list(r) for r in EP.mutes["A"]],
+                            "B": [list(r) for r in EP.mutes["B"]]}
+            server_versions = dict(EP.track_versions)
+            snapshot = EP.to_dict() if EP.loaded else {"loaded": False}
+        return {
+            "error": "以下轨的静音在本窗口编辑期间已被其他窗口保存，整次保存已拒绝："
+                     + "、".join(f"轨 {t}" for t in conflicts),
+            "conflicts": conflicts,
+            "server_mutes": server_mutes,
+            "server_track_versions": server_versions,
+            "submitted_mutes": {t: [list(r) for r in payload_mutes[t]] for t in submitted},
+            "state": snapshot,
+        }
 
-    with EP.lock:
-        if not EP.loaded or EP.tracks is not tracks:
-            return jsonify({"error": "剧集已被其他窗口更换，请刷新后重试"}), 409
-        old_hashes = EP.seg_hashes
-        invalidated = [i for i in range(len(new_hashes))
-                       if old_hashes[i] in EP.confirmed_hashes[i]
-                       and new_hashes[i] not in EP.confirmed_hashes[i]]
-        EP.mutes = new_mutes
-        EP.seg_hashes = new_hashes
-        EP.version += 1
-        state = EP.to_dict()
-    return jsonify({"ok": True, "invalidated": invalidated, "state": state})
+    rate = None
+    for attempt in range(MAX_MERGE_RETRIES + 1):
+        with EP.lock:
+            if not EP.loaded:
+                return jsonify({"error": "尚未上传音频"}), 409
+            # 同轨乐观并发：提交轨基线过期 -> 整次拒绝，不做任何修改
+            conflicts = [t for t in submitted
+                         if t in base_versions and base_versions[t] != EP.track_versions[t]]
+            if conflicts:
+                return jsonify(conflict_payload(conflicts)), 409
+            tracks = EP.tracks
+            rate = EP.sample_rate
+            n = EP.num_samples
+            snap_versions = dict(EP.track_versions)
+            new_mutes = {t: (payload_mutes[t] if t in payload_mutes else list(EP.mutes[t]))
+                         for t in TRACKS}
+
+        # 锁外重算全部新哈希：耗时计算不持锁，试听/确认/他窗口保存均可并发进行
+        new_hashes = compute_seg_hashes(tracks["A"], tracks["B"], new_mutes, rate, n)
+
+        with EP.lock:
+            if not EP.loaded:
+                return jsonify({"error": "尚未上传音频"}), 409
+            if EP.tracks is not tracks:
+                return jsonify({"error": "剧集已被其他窗口更换，请刷新后重试"}), 409
+            # 锁外重算期间同轨可能已被他处保存，提交轨再查一次基线
+            conflicts = [t for t in submitted
+                         if t in base_versions and base_versions[t] != EP.track_versions[t]]
+            if conflicts:
+                return jsonify(conflict_payload(conflicts)), 409
+            drifted = [t for t in TRACKS
+                       if EP.track_versions[t] != snap_versions[t]
+                       and (t not in submitted or t not in base_versions)]
+            if drifted:
+                # 未提交轨（或无基线旧客户端的提交轨）在重算期间被改：
+                # 本次哈希已过期，带最新另一轨重算重试，两边改动都保留。
+                # 递增退避（上限 0.5s），避免高并发下两个保存者互相使对方的重算持续失效。
+                time.sleep(min(0.02 * (attempt + 1), 0.5))
+                continue
+
+            old_hashes = EP.seg_hashes
+            invalidated = [i for i in range(len(new_hashes))
+                           if old_hashes[i] in EP.confirmed_hashes[i]
+                           and new_hashes[i] not in EP.confirmed_hashes[i]]
+            EP.mutes = new_mutes
+            EP.seg_hashes = new_hashes
+            for t in submitted:
+                EP.track_versions[t] += 1
+            EP.version += 1
+            state = EP.to_dict()
+        return jsonify({"ok": True, "invalidated": invalidated, "state": state})
+
+    return jsonify({"error": "并发改动过于频繁，静音合并重试已达上限，请稍后原样重试",
+                    "retryable": True}), 409
 
 
 @app.get("/api/segment/<int:idx>.wav")

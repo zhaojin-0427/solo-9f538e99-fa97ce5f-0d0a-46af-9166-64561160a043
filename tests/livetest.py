@@ -160,6 +160,90 @@ def main():
     # 跨窗口：新连接看到的静音与另一连接保存的一致
     check("跨窗口静音一致", json.loads(data)["mutes"]["B"] == [[60000, 60500]])
 
+    # ------------------------------------------------------------------
+    # 双窗口并发：分别改 A / B 轨，交错提交后两轨改动都生效（互不覆盖）
+    # 先重传重置，保证两轨版本都从 0、静音表都为空开始
+    # ------------------------------------------------------------------
+    body, ctype = multipart([("track_a", "a.wav", wa), ("track_b", "b.wav", wb)])
+    status, _, data = request("POST", "/api/upload", body, {"Content-Type": ctype})
+    assert status == 200, data[:200]
+    st = json.loads(request("GET", "/api/state")[2])
+    check("重传后每轨版本号为 0", st["track_versions"] == {"A": 0, "B": 0})
+
+    results = {}
+
+    def save_async(name, payload, base):
+        body = dict(payload)
+        body["base_versions"] = base
+        status, _, resp = request("POST", "/api/mutes", json.dumps(body),
+                                  {"Content-Type": "application/json"})
+        results[name] = (status, json.loads(resp))
+
+    t_a = threading.Thread(target=save_async,
+                           args=("A", {"A": [[10000, 11000]]}, {"A": 0}))
+    t_b = threading.Thread(target=save_async,
+                           args=("B", {"B": [[70000, 71000]]}, {"B": 0}))
+    t_a.start(); t_b.start(); t_a.join(); t_b.join()
+    check("两窗口并发保存均成功",
+          all(v[0] == 200 for v in results.values()), results)
+    st = json.loads(request("GET", "/api/state")[2])
+    check("两轨改动合并生效",
+          st["mutes"] == {"A": [[10000, 11000]], "B": [[70000, 71000]]}, st["mutes"])
+    check("两轨版本各自只递增一次",
+          st["track_versions"] == {"A": 1, "B": 1}, st["track_versions"])
+
+    # 同轨冲突：两个窗口都基于 A=1 编辑，后者必须被整次拒绝且 B 不受影响
+    status1, _, d1 = request("POST", "/api/mutes",
+                             json.dumps({"A": [[12000, 13000]],
+                                         "base_versions": {"A": 1}}),
+                             {"Content-Type": "application/json"})
+    check("窗口1 同轨先存 -> 200", status1 == 200, d1)
+    status2, _, d2raw = request("POST", "/api/mutes",
+                                json.dumps({"A": [[14000, 15000]],
+                                            "base_versions": {"A": 1}}),
+                                {"Content-Type": "application/json"})
+    d2 = json.loads(d2raw)
+    check("窗口2 过期基线 -> 409", status2 == 409, d2)
+    check("标出冲突轨 A", d2.get("conflicts") == ["A"], d2)
+    check("回带服务端静音与版本",
+          d2.get("server_mutes", {}).get("A") == [[12000, 13000]]
+          and d2.get("server_track_versions", {}).get("A") == 2, d2)
+    check("保留客户端提交输入", d2.get("submitted_mutes", {}).get("A") == [[14000, 15000]])
+    st = json.loads(request("GET", "/api/state")[2])
+    check("拒绝后 A 为窗口1 内容、B 改动仍在",
+          st["mutes"] == {"A": [[12000, 13000]], "B": [[70000, 71000]]}, st["mutes"])
+
+    # 旧客户端：只提交一轨且不带 base_versions，另一轨改动必须保留
+    status, _, d = request("POST", "/api/mutes",
+                           json.dumps({"A": [[20000, 21000]]}),
+                           {"Content-Type": "application/json"})
+    check("无基线单轨旧调用 -> 200", status == 200, d)
+    st = json.loads(request("GET", "/api/state")[2])
+    check("旧调用不抹掉 B 轨改动",
+          st["mutes"] == {"A": [[20000, 21000]], "B": [[70000, 71000]]}, st["mutes"])
+
+    # 冲突刷新基线后重提成功，随后对合并后的实际 PCM 重新逐段试听确认
+    cur_a = st["track_versions"]["A"]
+    status, _, d = request("POST", "/api/mutes",
+                           json.dumps({"A": [[14000, 15000]],
+                                       "base_versions": {"A": cur_a}}),
+                           {"Content-Type": "application/json"})
+    check("刷新基线后重提 -> 200", status == 200, d)
+    st = json.loads(request("GET", "/api/state")[2])
+    for seg in st["segments"]:
+        i = seg["index"]
+        _, hdr, _ = request("GET", f"/api/segment/{i}.wav")
+        sc, _, dd = request("POST", f"/api/confirm/{i}",
+                            json.dumps({"hash": hdr.get("X-Mix-Hash")}),
+                            {"Content-Type": "application/json"})
+        assert sc == 200, (i, sc, dd)
+    st = json.loads(request("GET", "/api/state")[2])
+    check("合并混音逐段确认后全部通过", st["all_passed"])
+    status, hdr, full = request("GET", "/api/download")
+    check("新下载按更新后通过状态放行 -> 200", status == 200)
+    check("下载长度与合并混音一致",
+          hdr.get("Content-Length") == str(44 + N * 2) and len(full) == 44 + N * 2)
+
     srv.shutdown()
     print()
     if FAILED:
